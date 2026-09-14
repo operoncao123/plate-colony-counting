@@ -34,6 +34,12 @@ def parse_args():
                    help='minimum countable colony diameter in mm (default 0.22; raise for '
                         '"only clearly visible dots" standards)')
     p.add_argument('--diff-thr', type=float, default=9.0, help='local-contrast threshold for blob segmentation')
+    p.add_argument('--core-frac-min', type=float, default=0.10,
+                   help='minimum fraction of blob pixels near peak brightness (smoothed diff > 16); '
+                        'below this the blob is a scratch/streak/texture ridge, not a white colony')
+    p.add_argument('--min-peak-smd', type=float, default=0.0,
+                   help='require the blob peak (smoothed diff) to exceed this; rejects low-contrast '
+                        'scratch ridges. Calibrate 13-17 so that a visually-verified plate keeps its count')
     p.add_argument('--no-extrapolate', action='store_true', help='do not extrapolate glare-excluded area')
     p.add_argument('--no-texture-filter', action='store_true',
                    help='disable meniscus-texture exclusion (for perfectly top-down photos)')
@@ -206,6 +212,16 @@ def main():
         dphi = math.degrees(abs((theta_major-theta_tan+math.pi/2) % math.pi-math.pi/2))
         # meniscus texture: elongated streak near rim, long axis parallel to boundary
         if not args.no_texture_filter and r_mean > 0.86 and elong > 2.2 and dphi < 20:
+            n_tex += 1
+            continue
+        # bright-core standard: a countable colony has a compact bright core (most blob
+        # pixels near its peak brightness). Scratches/plating-streak ridges have no
+        # bright core (core_frac ~ 0) even though they segment as elongated blobs.
+        core_frac = float((smd[sl][m] > 16).mean())
+        if core_frac < args.core_frac_min:
+            n_tex += 1
+            continue
+        if smd[sl][m].max() < args.min_peak_smd:
             n_tex += 1
             continue
         n_col = max(1, int((pk_blob == i).sum()))    # 1 peak = 1 colony; k peaks = k colonies
