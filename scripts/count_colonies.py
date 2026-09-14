@@ -33,8 +33,13 @@ def parse_args():
     p.add_argument('--min-colony-mm', type=float, default=0.22,
                    help='minimum countable colony diameter in mm (default 0.22; raise for '
                         '"only clearly visible dots" standards)')
-    p.add_argument('--diff-thr', type=float, default=9.0, help='local-contrast threshold for blob segmentation')
-    p.add_argument('--core-frac-min', type=float, default=0.10,
+    p.add_argument('--rel-thr', type=float, default=1.025,
+                   help='detection threshold on smoothed relative reflectance (gray/local-background). '
+                        'Relative detection prevents dim-photo regions from being systematically missed; '
+                        'the pre-threshold smoothing suppresses thin streak/scratch lines')
+    p.add_argument('--peak-rel', type=float, default=1.02,
+                   help='merge-peak threshold on relative reflectance')
+    p.add_argument('--core-frac-min', type=float, default=0.0,
                    help='minimum fraction of blob pixels near peak brightness (smoothed diff > 16); '
                         'below this the blob is a scratch/streak/texture ridge, not a white colony')
     p.add_argument('--min-peak-smd', type=float, default=0.0,
@@ -167,7 +172,9 @@ def main():
     bg_full = np.asarray(Image.fromarray(bg.astype(np.float32), 'F').resize((W, H), Image.BILINEAR))
     diff = gray - bg_full
 
-    bw = (diff > args.diff_thr) & region
+    rel = gray / np.maximum(bg_full, 1)
+    rel_s = ndi.gaussian_filter(rel, 2.5)   # colony-scale smoothing: kills thin streaks/scratches
+    bw = (rel_s > args.rel_thr) & region
     bw = ndi.binary_opening(bw, np.ones((2, 2)))
     lab, n = ndi.label(bw)
     sizes = np.bincount(lab.ravel(), minlength=n+1)
@@ -176,9 +183,9 @@ def main():
     MED = float(np.median([sizes[i-1] for i, sl in enumerate(objs, 1)
                            if sl and min_area <= sizes[i-1] <= 8*min_area])) or 1.0
     # intensity peaks inside each blob drive merge counting: a chain of k colonies
-    # has k brightness maxima even when the blob outline fuses them into one
-    smd = ndi.gaussian_filter(diff, 1.5)
-    peaks = (smd == ndi.maximum_filter(smd, 13)) & (smd > args.diff_thr) & region
+    # has k reflectance maxima even when the blob outline fuses them into one
+    smd = ndi.gaussian_filter(rel, 1.5)
+    peaks = (smd == ndi.maximum_filter(smd, 13)) & (smd > args.peak_rel) & region
     pl, pn = ndi.label(peaks)
     pk_yx = np.array(ndi.center_of_mass(peaks, pl, range(1, pn+1))) if pn else np.zeros((0, 2))
     pk_yi = pk_yx[:, 0].astype(int); pk_xi = pk_yx[:, 1].astype(int)
@@ -217,7 +224,7 @@ def main():
         # bright-core standard: a countable colony has a compact bright core (most blob
         # pixels near its peak brightness). Scratches/plating-streak ridges have no
         # bright core (core_frac ~ 0) even though they segment as elongated blobs.
-        core_frac = float((smd[sl][m] > 16).mean())
+        core_frac = float((smd[sl][m] > args.peak_rel + 0.025).mean())
         if core_frac < args.core_frac_min:
             n_tex += 1
             continue
