@@ -42,6 +42,10 @@ def parse_args():
     p.add_argument('--core-frac-min', type=float, default=0.0,
                    help='minimum fraction of blob pixels near peak brightness (smoothed diff > 16); '
                         'below this the blob is a scratch/streak/texture ridge, not a white colony')
+    p.add_argument('--circ-min', type=float, default=0.0,
+                   help='minimum circularity (4*pi*A/P^2) for unsplit blobs. DEFAULT 0: ground-truth '
+                        'testing showed soft-focus colonies have low digital circularity and a '
+                        '0.25 cutoff removed ~45% of real colonies. Enable only for sharp photos')
     p.add_argument('--min-peak-smd', type=float, default=0.0,
                    help='require the blob peak (smoothed diff) to exceed this; rejects low-contrast '
                         'scratch ridges. Calibrate 13-17 so that a visually-verified plate keeps its count')
@@ -231,7 +235,16 @@ def main():
         if smd[sl][m].max() < args.min_peak_smd:
             n_tex += 1
             continue
+        # circularity (4*pi*A/P^2): rejects rings/bubbles/jagged debris that pass size
+        # filters. Chains and soft defocused dots have lower boundary complexity, so the
+        # bar is conservative (0.25) and split blobs are exempt.
+        bnd_all = m & ~ndi.binary_erosion(m)
+        perim = max(bnd_all.sum(), 1)
+        circ = 4*math.pi*sz/(perim*perim)
         n_col = max(1, int((pk_blob == i).sum()))    # 1 peak = 1 colony; k peaks = k colonies
+        if n_col == 1 and circ < args.circ_min:
+            n_tex += 1
+            continue
         y_off, x_off = sl[0].start, sl[1].start
         if n_col == 1:
             n_single += 1
