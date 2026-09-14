@@ -169,36 +169,14 @@ def main():
 
     MED = float(np.median([sizes[i-1] for i, sl in enumerate(objs, 1)
                            if sl and min_area <= sizes[i-1] <= 8*min_area])) or 1.0
-    core_r = max(2.0, 0.45*math.sqrt(MED/math.pi))   # min distance-transform radius of a colony core
-    maxwin = int(max(5, 1.5*math.sqrt(MED/math.pi))) # peak suppression window
-
-    def split_blob(m):
-        """Watershed-style split of a merged blob: distance-transform peaks = colony centers.
-        Returns (n_colonies, list_of_submasks). Falls back to (1, [m]) if no split found."""
-        pad = 4
-        if m.shape[0] < 3*pad or m.shape[1] < 3*pad:
-            return 1, [m]
-        mp = np.pad(m, pad)
-        dt = ndi.gaussian_filter(ndi.distance_transform_edt(mp).astype(float), 0.8)
-        pk = (dt == ndi.maximum_filter(dt, size=maxwin)) & (dt > core_r) & mp
-        pl, npk = ndi.label(pk)
-        if npk < 2:
-            return 1, [m]
-        pc = np.array(ndi.center_of_mass(pk, pl, range(1, npk+1)))
-        keep = np.ones(npk, bool)
-        for i, j in cKDTree(pc).query_pairs(r=maxwin*0.7):
-            keep[j if dt[tuple(pc[i].astype(int))] >= dt[tuple(pc[j].astype(int))] else i] = False
-        centers = pc[keep]
-        if len(centers) < 2:
-            return 1, [m]
-        ys, xs = np.nonzero(mp)
-        _, idx = cKDTree(centers).query(np.column_stack([ys, xs]), k=1)
-        subs = []
-        for k in range(len(centers)):
-            sm_k = np.zeros_like(mp)
-            sm_k[ys[idx == k], xs[idx == k]] = True
-            subs.append(sm_k[pad:-pad, pad:-pad])
-        return len(centers), subs
+    # intensity peaks inside each blob drive merge counting: a chain of k colonies
+    # has k brightness maxima even when the blob outline fuses them into one
+    smd = ndi.gaussian_filter(diff, 1.5)
+    peaks = (smd == ndi.maximum_filter(smd, 13)) & (smd > args.diff_thr) & region
+    pl, pn = ndi.label(peaks)
+    pk_yx = np.array(ndi.center_of_mass(peaks, pl, range(1, pn+1))) if pn else np.zeros((0, 2))
+    pk_yi = pk_yx[:, 0].astype(int); pk_xi = pk_yx[:, 1].astype(int)
+    pk_blob = lab[pk_yi, pk_xi]                      # which blob each peak lives in
 
     n_single = n_pair = n_chain = n_tex = 0
     total = 0
@@ -230,12 +208,8 @@ def main():
         if not args.no_texture_filter and r_mean > 0.86 and elong > 2.2 and dphi < 20:
             n_tex += 1
             continue
+        n_col = max(1, int((pk_blob == i).sum()))    # 1 peak = 1 colony; k peaks = k colonies
         y_off, x_off = sl[0].start, sl[1].start
-        # candidate merged blob -> watershed split; round compact blob -> single
-        if elong > 2.5 or sz > 2.2*MED:
-            n_col, subs = split_blob(m)
-        else:
-            n_col, subs = 1, [m]
         if n_col == 1:
             n_single += 1
         elif n_col == 2:
@@ -244,15 +218,20 @@ def main():
             n_chain += 1
         total += n_col
         centroids.append((cy0, cx0, n_col))
-        for sm_k in subs:
-            bnd = sm_k & ~ndi.binary_erosion(sm_k)
-            ys, xs = np.nonzero(bnd)
-            col = (255, 40, 40) if len(subs) == 1 else (0, 90, 255)
-            if len(xs) < 4:
-                continue
-            cy0, cx0 = ys.mean(), xs.mean()
-            order = np.argsort(np.arctan2(ys-cy0, xs-cx0))
-            mark_list.append(([(xs[o]+x_off, ys[o]+y_off) for o in order], col))
+        bnd = m & ~ndi.binary_erosion(m)
+        ys, xs = np.nonzero(bnd)
+        col = (255, 40, 40) if n_col == 1 else (0, 90, 255)
+        if len(xs) < 6:
+            dr_ellipse = (xs.mean()+x_off, ys.mean()+y_off)
+            mark_list.append(('ellipse', dr_ellipse, col))
+            continue
+        cyb, cxb = ys.mean(), xs.mean()
+        order = np.argsort(np.arctan2(ys-cyb, xs-cxb))
+        mark_list.append(('line', [(xs[o]+x_off, ys[o]+y_off) for o in order], col))
+        if n_col > 1:   # mark the counted peaks inside merged blobs for transparency
+            sel = np.where(pk_blob == i)[0]
+            for pyi, pxi in zip(pk_yi[sel], pk_xi[sel]):
+                mark_list.append(('dot', (pxi, pyi), (0, 200, 0)))
 
     # glare extrapolation from neighbouring ring (0.75..shrink, uncapped)
     extrap = 0.0
@@ -262,24 +241,9 @@ def main():
         d_ring = sum(ring_cs)/max(ring_area, 1e-9)
         extrap = d_ring*glare.sum()/1e6
 
-    # independent cross-check: local maxima, size-matched to the blob filter
-    smd = ndi.gaussian_filter(diff, 1.5)
-    peaks = (smd == ndi.maximum_filter(smd, 13)) & (smd > args.diff_thr) & region
-    pl, pn = ndi.label(peaks)
-    peak_count = 0
-    if pn:
-        blobs = ndi.binary_dilation(peaks, np.ones((9, 9))) & (diff > args.diff_thr*0.8) & region
-        bl, bn = ndi.label(blobs)
-        bsz2 = np.bincount(bl.ravel(), minlength=bn+1)
-        blob_of_peak = ndi.maximum(bl, pl, np.arange(1, pn+1)).astype(int)
-        ok = np.where(bsz2[blob_of_peak] >= min_area)[0] + 1
-        if len(ok):
-            pc = np.array(ndi.center_of_mass(peaks, pl, ok))
-            pv = smd[pc[:, 0].astype(int), pc[:, 1].astype(int)]
-            keep = np.ones(len(pc), bool)
-            for i, j in cKDTree(pc).query_pairs(r=7.0):
-                keep[j if pv[i] >= pv[j] else i] = False
-            peak_count = int(keep.sum())
+    # cross-check: number of distinct blobs (before merge splitting) - the gap to
+    # direct_count quantifies how much merging occurred
+    blob_count = sum(1 for (cy0, cx0, c) in centroids)
 
     # annotation: trace actual blob contours (tilted photo -> colonies are not circles)
     dr = ImageDraw.Draw(im)
@@ -288,31 +252,31 @@ def main():
         px, py = A*args.shrink*math.cos(a), B*args.shrink*math.sin(a)
         bpts.append((cx+px*math.cos(th)-py*math.sin(th), cy+px*math.sin(th)+py*math.cos(th)))
     dr.line(bpts+[bpts[0]], fill=(255, 230, 0), width=6)
-    for pts, col in mark_list:
-        if len(pts) < 6:
-            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-            dr.ellipse([np.mean(xs)-9, np.mean(ys)-9, np.mean(xs)+9, np.mean(ys)+9],
-                       outline=col, width=3)
-            continue
-        dr.line(pts+[pts[0]], fill=col, width=4, joint='curve')
+    for kind, geom, col in mark_list:
+        if kind == 'line':
+            dr.line(geom+[geom[0]], fill=col, width=4, joint='curve')
+        elif kind == 'ellipse':
+            dr.ellipse([geom[0]-9, geom[1]-9, geom[0]+9, geom[1]+9], outline=col, width=3)
+        else:  # 'dot': a counted peak inside a merged blob
+            dr.ellipse([geom[0]-3, geom[1]-3, geom[0]+3, geom[1]+3], fill=col)
     ann_path = f'{outdir}/annotated.jpg'
     im.save(ann_path, quality=88)
 
     final = total+extrap
     report = dict(image=args.image, final_count=round(final), direct_count=total,
-                  extrapolated=round(extrap), crosscheck_peak_method=peak_count,
+                  extrapolated=round(extrap), crosscheck_blob_count=blob_count,
                   single=n_single, merged_pairs=n_pair, chains=n_chain,
                   texture_excluded=n_tex, px_per_mm=round(px_per_mm, 2),
                   min_colony_mm=args.min_colony_mm, agar_boundary_frac=args.shrink,
                   dish_ellipse=dict(cx=cx, cy=cy, A=A, B=B, theta=th),
-                  note='red contour=1 colony, blue=merged (2+), yellow=agar boundary. '
-                       'Uncertainty +/-10-15%. VERIFY boundary_check.jpg (yellow on agar/rim '
-                       'edge in all sectors) and annotated.jpg (contours on visible colonies) '
+                  note='red contour=1 colony, blue contour=merged blob (green dots = the '
+                       'counted colonies inside it), yellow=agar boundary. Uncertainty '
+                       '+/-10-15%. VERIFY boundary_check.jpg (yellow on agar/rim edge in '
+                       'all sectors) and annotated.jpg (contours on visible colonies) '
                        'before reporting; if boundary is off, rerun with --shrink or --ellipse.')
     json.dump(report, open(f'{outdir}/count_report.json', 'w'), indent=1, ensure_ascii=False)
-    print(f'single={n_single} pairs={n_pair}(x2) chains={n_chain} texture_excluded={n_tex}')
-    print(f'direct={total} + extrapolated={extrap:.0f} -> FINAL ~{final:.0f} '
-          f'(peak cross-check: {peak_count})')
+    print(f'single={n_single} pairs={n_pair}(x2) chains={n_chain}(3+) texture_excluded={n_tex}')
+    print(f'direct={total} (blobs={blob_count}) + extrapolated={extrap:.0f} -> FINAL ~{final:.0f}')
     print(f'outputs: {ann_path} | {outdir}/count_report.json | {outdir}/boundary_check.jpg')
     print('NEXT: view boundary_check.jpg (yellow must sit on the agar/rim edge in all '
           'sectors) and annotated.jpg (contours must sit on visible colonies) before '
