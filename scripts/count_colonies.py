@@ -30,9 +30,11 @@ def parse_args():
     p.add_argument('--ellipse', default=None,
                    help='manual override "cx,cy,A,B,theta_deg" - use when boundary_check.jpg '
                         'shows the automatic boundary off the agar edge')
-    p.add_argument('--min-colony-mm', type=float, default=0.22,
-                   help='minimum countable colony diameter in mm (default 0.22; raise for '
-                        '"only clearly visible dots" standards)')
+    p.add_argument('--min-colony-mm', type=float, default=0.5,
+                   help='minimum countable colony diameter in mm (default 0.5). On overnight plates '
+                        'all colonies reach similar size, so the detected size distribution should be '
+                        'unimodal; set this at the valley below the main population. Debris, precipitate '
+                        'and marks form a separate small-blob population that this excludes')
     p.add_argument('--rel-thr', type=float, default=1.025,
                    help='detection threshold on smoothed relative reflectance (gray/local-background). '
                         'Relative detection prevents dim-photo regions from being systematically missed; '
