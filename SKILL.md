@@ -16,7 +16,20 @@ specular rims and blotchy agar. The pipeline below was re-calibrated on such pho
 python3 scripts/count_colonies.py <photo.jpg> --outdir <results_dir>
 # several at once:
 python3 scripts/count_colonies.py 1.jpg 2.jpg 3.jpg 4.jpg 5.jpg --outdir results/
+# tilted hand-held photo where boundary_check.jpg does not sit on the agar edge:
+python3 scripts/count_colonies.py <photo.jpg> --outdir <results_dir> \
+        --robust-boundary --shrink 1.0
 ```
+
+Boundary-related options:
+- `--robust-boundary` — find the agar/rim junction from the bright-AND-speckled
+  region instead of the single strongest radial gradient. This fits the **agar** edge
+  directly, so pair it with `--shrink 1.0`.
+- `--boundary-json FILE` — supply the dish ellipse (`cx,cy,a,b,angle`) directly when
+  the automatic fit is off; use with `--shrink 1.0` if the ellipse is the agar edge.
+- `--px-per-mm X` — override the mm scale. Worth pinning when comparing counts across
+  plates: the size filter is driven by `px_per_mm`, so a boundary change moves the
+  effective `--min-diam-mm` cutoff even when the geometry barely changes.
 
 Outputs per image in `<results_dir>/<stem>/`:
 - `annotated.jpg` — a legend is burned into the image, so it is self-describing:
@@ -39,7 +52,9 @@ distinct ways; each step catches a specific failure mode.
 1. **Boundary** (`boundary_check.jpg`): the yellow line must lie on the agar/rim
    junction all the way round, i.e. agar on the inside, plastic rim on the outside,
    and no visible colony outside it. If it cuts into agar, raise `--shrink`; if it
-   overlaps the rim, lower it. Typical 0.93-0.96.
+   overlaps the rim, lower it. Typical 0.93-0.96. If the line is off the dish
+   entirely in some sectors (common on tilted photos), the fit itself is broken —
+   see "When the boundary is wrong" and use `--robust-boundary --shrink 1.0`.
 2. **Markers** (`zoom_*.jpg`, 1:1): every colony a human would count carries exactly
    one orange cross; touching colonies carry one each; nothing is marked on blank
    agar. Blue-outlined blobs should all be rim/meniscus streaks, never colonies.
@@ -63,6 +78,8 @@ distinct ways; each step catches a specific failure mode.
    observed agar boundary ranged from 0.85 to 0.95 of the raw Hough radius across
    five photos of the same plate type; against the refined ellipse it is a stable
    ~0.95.*
+   **This gradient search is the weakest link on a strongly tilted photo** — see
+   "When the boundary is wrong" below; `--robust-boundary` replaces it.
 2. **Agar mask** = refined ellipse × `--shrink`.
 3. **White top-hat**: `tophat = gray - median(downscale(gray, 4), 31)`. Removes
    illumination gradients and glare without capping bright dense regions (a global
@@ -81,6 +98,47 @@ distinct ways; each step catches a specific failure mode.
    the smallest 45% of components (merges inflate the rest).
 7. **Independent cross-check**: local maxima of the Gaussian-smoothed top-hat,
    minimum separation 1.0 × colony radius.
+
+## When the boundary is wrong (tilted photos)
+
+Symptom: in `boundary_check.jpg` the yellow line runs through the dark bench above
+and below the dish, or cuts into agar on one side and overlaps the rim on the other.
+
+Cause: the per-angle detector keeps the **single strongest** radial gradient, and on
+a tilted photo that feature is the agar edge on some rays, the rim highlight on
+others, the meniscus on others, and a lit-bench reflection on the rest. The points it
+collects therefore lie on **two or more different curves**, and a plain least-squares
+`cv2.fitEllipse` gets dragged by the minority. Measured on one such photo: the 720
+points split into two smooth arcs (~1580 px over the left/top, ~1200 px over the
+right/bottom), RANSAC inlier count **2/720**, and the resulting ellipse came out
+1454 x 1397 px — *taller than wide, while the dish was wider than tall* — so it
+floated ~100 px off the dish at the top and ~150 px at the bottom. The fix is not a
+different `--shrink`: no scalar can repair an ellipse with the wrong shape.
+
+Fix, in order of preference:
+
+1. `--robust-boundary --shrink 1.0`. Uses a physically specific cue: **agar is the
+   only bright AND speckled surface**. A band-pass energy map at the colony scale
+   (~10 px, box-averaged 25 px) is high on agar and low on the smooth plastic rim,
+   the dark meniscus and the dark bench; walking outward from the plate centre, the
+   first *sustained* drop of (speckled AND bright) is the agar/rim junction no matter
+   what lies beyond. The result is fitted with RANSAC + iteratively reweighted least
+   squares. Note the caveat: it fits the **agar** edge, so `--shrink` must be 1.0.
+2. `--boundary-json FILE` with an ellipse measured by hand from intensity profiles
+   through the image, then `--shrink 1.0`.
+3. Last resort: nudge `--shrink` only if the ellipse *shape* is right and merely
+   inset by the wrong amount.
+
+Do **not** reach for a general-purpose local-std "texture" map here: std also fires
+on any high-contrast edge, including the bright rim highlight, which is precisely
+what makes the gradient method jump between curves in the first place.
+
+How much it matters: on the photo above, with `px_per_mm` pinned so the size filter
+was identical, swapping the wrong boundary for the measured agar edge moved the
+count from 16996 to 17636 (**+3.8%**). The boundary geometry is a second-order
+effect; the first-order effect is that `px_per_mm` is derived *from* the ellipse and
+drives the `--min-diam-mm` cutoff, so a boundary change silently moves the size
+threshold too. When comparing counts across plates, pin `--px-per-mm`.
 
 ## Counting rules (calibrated defaults)
 
@@ -113,6 +171,7 @@ roughly round white dots.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Watch out: the boundary looks fine on a sparse plate and cuts off outer colonies on a dense one | shrinkage applied to a sloppy Hough radius, not to the real rim | the refined ellipse fixes it; verify per plate with `boundary_check.jpg`, don't reuse one `--shrink` blindly |
+| Boundary runs through the background above/below the dish, or cuts agar on one side and overlaps the rim on the other (tilted photo) | per-angle "strongest gradient" lands on the agar edge / rim highlight / meniscus / bench reflection on different rays, so the 720 points lie on two curves and a non-robust `fitEllipse` is dragged (measured: 2/720 inliers, ellipse came out taller than wide) | `--robust-boundary --shrink 1.0` (bright-AND-speckled cue, RANSAC fit), or `--boundary-json` with a hand-measured ellipse. No `--shrink` value can repair an ellipse of the wrong shape |
 | Count far too high; marks along a ring near the rim; blobs "connected into lines" | agar-edge highlight arc / meniscus streak detected and watershed-split into many colonies | distance-transform thickness test + solidity test (built in); blue outlines in `annotated.jpg` show what was rejected |
 | Count far too high, marks on faint speckles | threshold too loose, agar texture detected | raise `--min-diam-mm`; compare `zoom_*.jpg` against what your eye counts |
 | Count too low, dense centre under-marked | global brightness cap or grey-opening background removes bright dense patches | keep the median-filter background (default); never cap absolute brightness inside the plate |
@@ -129,7 +188,9 @@ roughly round white dots.
   × 1000 for transformants/µg vector. Typical good Gibson/ligation: 1e5-1e6/µg.
 - `px_per_mm` in the report comes from assuming `--dish-mm` for the fitted ellipse;
   it is only used for the mm-based size filter, so a wrong `--dish-mm` shifts the
-  size threshold, not the count by area.
+  size threshold, not the count by area. Note the coupling: because `px_per_mm` is
+  derived *from* the ellipse, changing the boundary also moves the effective
+  `--min-diam-mm` cutoff. Pin `--px-per-mm` when comparing counts across plates.
 - Density variation across the plate (centre-heavy after spreading) is normal;
   mention it if the user will pick colonies (sample randomly across sectors).
 - Density that allows picking: ~1-10 k colonies per 9-10 cm dish. Overgrown/lawn:

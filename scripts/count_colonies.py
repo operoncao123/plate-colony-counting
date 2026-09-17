@@ -76,6 +76,121 @@ def _refine_ellipse(im, cx, cy, R0, nang=720, lo=0.80, hi=1.14, sigma=4.0):
                 angle=float(ang))
 
 
+def _speckle_map(gray, sigma=4.0, box=25):
+    """Band-pass energy at the colony scale (~10 px), box-averaged.
+
+    Agar carries colony speckle; the smooth plastic rim, the meniscus ring and a
+    plain bench do not.  Deliberately NOT a local-std map: std also fires on any
+    high-contrast edge, including the bright rim highlight, which is what makes the
+    gradient method jump between several curves.
+    """
+    hp = gray.astype(np.float32) - cv2.GaussianBlur(gray.astype(np.float32), (0, 0), sigma)
+    return cv2.blur(np.abs(hp), (box, box))
+
+
+def _refine_ellipse_robust(im, cx, cy, R0, speck=11.0, bright=90.0,
+                           gap=40.0, nang=720, verbose=True):
+    """Agar ellipse from the bright-AND-speckled region, robustly fitted.
+
+    Walks outward along each ray and takes the first *sustained* drop of
+    (speckled AND bright) - i.e. the agar/rim junction, whatever lies beyond it
+    (dark bench, lit bench, rim highlight).  Several rays inevitably land badly
+    (a clumped colony reads smooth, a partially colonised edge, the dish clipped
+    by the frame), so the fit is RANSAC + iteratively reweighted rather than a
+    plain least-squares cv2.fitEllipse.
+    Returns (ellipse, inlier_fraction) or (None, 0.0) if it cannot be trusted.
+    """
+    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape[:2]
+    ok = ((_speckle_map(gray) > speck) & (gray > bright)).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(ok, 8)
+    if n > 1:
+        i = lab[int(np.clip(cy, 0, H - 1)), int(np.clip(cx, 0, W - 1))]
+        if i == 0:
+            i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        ys, xs = np.nonzero(lab == i)
+        if len(xs) > 1000:
+            cx, cy = float(xs.mean()), float(ys.mean())
+
+    def edges(ccx, ccy, r_lo, r_hi):
+        rs = np.arange(r_lo, r_hi, 1.0).astype(np.float32)
+        pts = []
+        for k in range(nang):
+            t = 2 * np.pi * k / nang
+            x = np.clip(ccx + rs * np.cos(t), 0, W - 1)
+            y = np.clip(ccy + rs * np.sin(t), 0, H - 1)
+            v = cv2.remap(ok, x.reshape(1, -1).astype(np.float32),
+                          y.reshape(1, -1).astype(np.float32),
+                          cv2.INTER_NEAREST).ravel()
+            nz = np.nonzero(v)[0]
+            if len(nz) == 0 or rs[nz[0]] > 0.85 * r_hi:
+                continue
+            above = v.copy()
+            above[:nz[0]] = 1
+            last, run = 0, 0
+            for j in range(len(above)):
+                if above[j]:
+                    last, run = j, 0
+                else:
+                    run += 1
+                    if run > gap:
+                        break
+            pts.append([ccx + rs[last] * np.cos(t), ccy + rs[last] * np.sin(t)])
+        return np.asarray(pts, np.float64)
+
+    def resid(pts, e):
+        t = np.deg2rad(e["angle"])
+        x0, y0 = pts[:, 0] - e["cx"], pts[:, 1] - e["cy"]
+        xr = x0 * np.cos(t) + y0 * np.sin(t)
+        yr = -x0 * np.sin(t) + y0 * np.cos(t)
+        rr = np.hypot(xr / e["a"], yr / e["b"])
+        g = np.hypot(xr / e["a"] ** 2, yr / e["b"] ** 2)
+        return (rr - 1.0) / np.maximum(g, 1e-9)
+
+    def fit(pts):
+        (ex, ey), (d1, d2), ang = cv2.fitEllipse(
+            pts.astype(np.float32).reshape(-1, 1, 2))
+        return dict(cx=float(ex), cy=float(ey), a=float(max(d1, d2) / 2),
+                    b=float(min(d1, d2) / 2), angle=float(ang))
+
+    R = R0
+    inl = None
+    e = None
+    for _ in range(4):
+        pts = edges(cx, cy, 0.35 * R, 1.25 * R)
+        if len(pts) < 200:
+            return None, 0.0
+        rng = np.random.default_rng(0)
+        best = None
+        for _ in range(3000):
+            idx = rng.choice(len(pts), 5, replace=False)
+            try:
+                cand = fit(pts[idx])
+            except cv2.error:
+                continue
+            if not (700 < 2 * cand["a"] < 4000 and 700 < 2 * cand["b"] < 4000):
+                continue
+            k = int((np.abs(resid(pts, cand)) < 15).sum())
+            if best is None or k > best[0]:
+                best = (k, cand)
+        if best is None:
+            return None, 0.0
+        e = best[1]
+        inl = np.abs(resid(pts, e)) < 15
+        for _ in range(8):
+            e = fit(pts[inl])
+            r = np.abs(resid(pts, e))
+            s = 1.4826 * np.median(r[inl])
+            inl = r <= max(4.0, 2.2 * s)
+        cx, cy, R = e["cx"], e["cy"], (e["a"] + e["b"]) / 2
+    frac = float(inl.sum()) / float(len(pts))
+    if verbose:
+        print("  robust boundary: a=%.0f b=%.0f angle=%.1f centre=(%.0f,%.0f) "
+              "inliers=%.0f%%" % (e["a"], e["b"], e["angle"], e["cx"], e["cy"],
+                                  100 * frac))
+    return e, frac
+
+
 def ellipse_mask(shape, ell, scale):
     m = np.zeros(shape[:2], np.uint8)
     cv2.ellipse(m, ((ell["cx"], ell["cy"]),
@@ -107,7 +222,9 @@ def flat_background(gray, ds=4):
 # --------------------------------------------------------------------- counter
 def count_plate(path, shrink=0.95, min_diam_mm=0.25, dish_mm=90.0,
                 peak_frac=0.45, min_dist_frac=1.15, valid_frac=0.55,
-                frag_frac=0.35, solidity_min=0.45, verbose=True):
+                frag_frac=0.35, solidity_min=0.45, verbose=True,
+                robust_boundary=False, boundary_json=None, px_per_mm=None,
+                min_inlier_frac=0.55):
     im = cv2.imread(path)
     if im is None:
         raise FileNotFoundError(path)
@@ -117,9 +234,29 @@ def count_plate(path, shrink=0.95, min_diam_mm=0.25, dish_mm=90.0,
     hc = _hough_circle(im)
     if hc is None:
         raise RuntimeError("could not locate the dish in %s" % path)
-    ell = _refine_ellipse(im, *hc)
+    if boundary_json:
+        with open(boundary_json) as fh:
+            d = json.load(fh)
+        ell = dict(cx=float(d["cx"]), cy=float(d["cy"]), a=float(d["a"]),
+                   b=float(d["b"]), angle=float(d["angle"]))
+        if verbose:
+            print("  boundary: supplied from %s (a=%.0f b=%.0f angle=%.1f)"
+                  % (boundary_json, ell["a"], ell["b"], ell["angle"]))
+    elif robust_boundary:
+        ell2, frac = _refine_ellipse_robust(im, *hc, verbose=verbose)
+        if ell2 is not None and frac >= min_inlier_frac:
+            ell = ell2
+        else:
+            ell = _refine_ellipse(im, *hc)
+            if verbose:
+                print("  robust boundary untrustworthy (inliers %.0f%% < %.0f%%) "
+                      "-> fell back to the gradient fit"
+                      % (100 * frac, 100 * min_inlier_frac))
+    else:
+        ell = _refine_ellipse(im, *hc)
     mask = ellipse_mask(im.shape, ell, shrink)
-    px_per_mm = 2.0 * ((ell["a"] + ell["b"]) / 2.0) * shrink / dish_mm
+    if px_per_mm is None:
+        px_per_mm = 2.0 * ((ell["a"] + ell["b"]) / 2.0) * shrink / dish_mm
 
     # 3-4. top-hat + threshold
     th = cv2.GaussianBlur(cv2.subtract(gray, flat_background(gray)), (3, 3), 0)
@@ -342,13 +479,28 @@ def main(argv=None):
     ap.add_argument("--min-diam-mm", type=float, default=0.25,
                     help="minimum colony diameter counted (mm)")
     ap.add_argument("--solidity-min", type=float, default=0.45)
+    ap.add_argument("--robust-boundary", action="store_true",
+                    help="find the agar/rim junction from the bright-AND-speckled "
+                         "region instead of the single strongest radial gradient "
+                         "(use on tilted hand-held photos where the rim highlight, "
+                         "meniscus and bench reflections confuse the gradient). "
+                         "NOTE: this fits the AGAR edge directly, so pair it with "
+                         "--shrink 1.0 (shrink 0.95 would inset it a further 5%%)")
+    ap.add_argument("--boundary-json", default=None,
+                    help="JSON with cx,cy,a,b,angle to use as the dish ellipse "
+                         "instead of fitting one")
+    ap.add_argument("--px-per-mm", type=float, default=None,
+                    help="override the mm scale (otherwise derived from the ellipse)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
 
     for p in a.images:
         res = count_plate(p, shrink=a.shrink, min_diam_mm=a.min_diam_mm,
                           dish_mm=a.dish_mm, solidity_min=a.solidity_min,
-                          verbose=not a.quiet)
+                          verbose=not a.quiet,
+                          robust_boundary=a.robust_boundary,
+                          boundary_json=a.boundary_json,
+                          px_per_mm=a.px_per_mm)
         res["path"] = p
         stem = os.path.splitext(os.path.basename(p))[0]
         outdir = os.path.join(a.outdir, stem) if a.outdir else \
