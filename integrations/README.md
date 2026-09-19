@@ -26,7 +26,7 @@ Notes:
   [trae-rules-snippet.md](trae-rules-snippet.md) into `.trae/rules/project_rules.md`.
 * The script never touches tool config beyond the paths listed above; it skips
   `integrations/` when copying (that is repo packaging, not skill).
-* The counting script needs only `numpy`, `scipy`, `pillow` — no OpenCV.
+* The counting script needs only `numpy` and `opencv-python`.
 
 Sources for the per-tool mechanisms: [Codex skills](https://simonwillison.net/2025/Dec/12/openai-skills/) ·
 [OpenCode commands](https://opencode.ai/docs/commands/) ·
